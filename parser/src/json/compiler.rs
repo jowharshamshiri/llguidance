@@ -32,6 +32,14 @@ pub struct JsonCompileOptions {
     /// Defaults to full JSON set: nrbtf"u\
     /// For example, set to nrbtf"\ to disallow \uXXXX escapes.
     pub json_allowed_escapes: Option<String>,
+    /// Let the properties an object schema names come in any order, instead
+    /// of the order the schema lists them in. JSON objects are unordered, and
+    /// a fixed order makes the model write keys in an order it did not choose
+    /// (an answer after its justification, or the reverse). Entries matched
+    /// only by `patternProperties`/`additionalProperties` still follow the
+    /// named ones. The grammar has a node per subset of the named properties,
+    /// so an object naming more than [`MAX_UNORDERED_PROPERTIES`] is refused.
+    pub unordered_properties: bool,
     #[serde(skip)]
     pub retriever: Option<RetrieveWrapper>,
 }
@@ -50,6 +58,11 @@ impl std::fmt::Display for UnsatisfiableSchemaError {
         write!(f, "Unsatisfiable schema: {}", self.message)
     }
 }
+
+/// The most named properties one object may have under
+/// [`JsonCompileOptions::unordered_properties`]: its grammar has a node for
+/// every subset of them (2^12 = 4096).
+pub const MAX_UNORDERED_PROPERTIES: usize = 12;
 
 const CHAR_REGEX: &str = r#"(\\([\"\\\/bfnrt]|u[a-fA-F0-9]{4})|[^\"\\\x00-\x1F\x7F])"#;
 
@@ -85,6 +98,7 @@ impl Default for JsonCompileOptions {
             coerce_one_of: false,
             lenient: false,
             json_allowed_escapes: None,
+            unordered_properties: false,
             retriever: None,
         }
     }
@@ -594,11 +608,12 @@ impl Compiler {
             }
         }
 
+        let mut extra = None;
         if !pattern_options.is_empty() && max_properties != Some(0) {
             let pattern = self.builder.select(&pattern_options);
             let required = min_properties > 0;
             let seq = self.bounded_sequence(pattern, min_properties, max_properties)?;
-            items.push((seq, required));
+            extra = Some((seq, required));
         } else if min_properties > 0 {
             return Err(anyhow!(UnsatisfiableSchemaError {
                 message: format!(
@@ -607,14 +622,80 @@ impl Compiler {
             }));
         }
 
-        self.object_fields(&items)
+        self.object_fields_then(&items, extra)
     }
 
     fn object_fields(&mut self, items: &[(NodeRef, bool)]) -> Result<NodeRef> {
+        self.object_fields_then(items, None)
+    }
+
+    /// `{`, the named properties `items`, then `extra` (the entries matched by
+    /// `patternProperties`/`additionalProperties`), `}`.
+    fn object_fields_then(
+        &mut self,
+        items: &[(NodeRef, bool)],
+        extra: Option<(NodeRef, bool)>,
+    ) -> Result<NodeRef> {
         let opener = self.builder.string("{");
-        let inner = self.ordered_sequence(items, false, &mut HashMap::default())?;
+        let inner = if self.options.unordered_properties {
+            if items.len() > MAX_UNORDERED_PROPERTIES {
+                bail!(
+                    "an object schema names {} properties; with unordered_properties at most {} \
+                     are supported (its grammar has a node for every subset of them)",
+                    items.len(),
+                    MAX_UNORDERED_PROPERTIES
+                );
+            }
+            let unused = (1u32 << items.len()) - 1;
+            self.unordered_sequence(items, extra, unused, false, &mut HashMap::default())?
+        } else {
+            let mut all = items.to_vec();
+            all.extend(extra);
+            self.ordered_sequence(&all, false, &mut HashMap::default())?
+        };
         let closer = self.builder.string("}");
         Ok(self.builder.join(&[opener, inner, closer]))
+    }
+
+    /// The rest of an object whose named properties `unused` (a bit per entry
+    /// of `items`) have not been written: any one of them next, or — once no
+    /// required one is left — `extra` and the end. `prefixed` says whether an
+    /// entry has been written already, so the next needs a separator.
+    fn unordered_sequence(
+        &mut self,
+        items: &[(NodeRef, bool)],
+        extra: Option<(NodeRef, bool)>,
+        unused: u32,
+        prefixed: bool,
+        cache: &mut HashMap<(u32, bool), NodeRef>,
+    ) -> Result<NodeRef> {
+        if let Some(node) = cache.get(&(unused, prefixed)) {
+            return Ok(*node);
+        }
+        let mut options = vec![];
+        let mut required_left = false;
+        for (idx, (item, required)) in items.iter().enumerate() {
+            let bit = 1u32 << idx;
+            if unused & bit == 0 {
+                continue;
+            }
+            required_left |= *required;
+            let rest = self.unordered_sequence(items, extra, unused & !bit, true, cache)?;
+            let option = if prefixed {
+                let comma = self.item_separator()?;
+                self.builder.join(&[comma, *item, rest])
+            } else {
+                self.builder.join(&[*item, rest])
+            };
+            options.push(option);
+        }
+        if !required_left {
+            let tail: Vec<(NodeRef, bool)> = extra.into_iter().collect();
+            options.push(self.ordered_sequence(&tail, prefixed, &mut HashMap::default())?);
+        }
+        let node = self.builder.select(&options);
+        cache.insert((unused, prefixed), node);
+        Ok(node)
     }
 
     #[allow(clippy::type_complexity)]

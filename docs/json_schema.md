@@ -88,6 +88,13 @@ Following keys are available inside of it:
   `"nrbtf\\\""` to disallow `\uXXXX` escapes. Note that removing `u` means control characters
   without named escapes (for example, U+0000, U+001E) become unrepresentable.
 - `lenient`, defaults to `false`; when set to `true`, the unsupported keywords and formats will be ignored; implies `coerce_one_of: true`
+- `unordered_properties`, defaults to `false`; when set to `true`, the properties an object
+  schema names in `"properties"` may be generated in any order (each at most once, every
+  required one present), instead of the order in which the schema lists them. JSON objects
+  are unordered; a fixed order makes a model write keys in an order it did not choose.
+  Entries allowed only by `"patternProperties"` or `"additionalProperties"` still follow the
+  named ones. The grammar has a node for every subset of the named properties, so an object
+  naming more than 12 properties is refused.
 
 For example:
 
